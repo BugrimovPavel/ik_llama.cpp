@@ -5,49 +5,187 @@ on:
 
 jobs:
   build:
+    name: Windows CUDA 12.8 sm120
     runs-on: windows-2022
 
     steps:
-      - name: Checkout
+      # ============================================================
+      # Checkout
+      # ============================================================
+      - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
 
-      - name: Install CUDA 12.8
+      # ============================================================
+      # CUDA 12.8
+      # Blackwell / RTX 5060 Ti requires sm_120 support
+      # ============================================================
+      - name: Install CUDA Toolkit 12.8
         uses: Jimver/cuda-toolkit@v0.2.24
         with:
           cuda: '12.8.1'
           method: network
-          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev"]'
+          sub-packages: '["nvcc","cudart","cublas","cublas_dev"]'
 
-      - name: Configure
-        shell: cmd
-        run: >
-          cmake -S . -B build
-          -G "Visual Studio 17 2022"
-          -A x64
-          -DGGML_CUDA=ON
-          -DCMAKE_CUDA_ARCHITECTURES=120
-          -DGGML_IQK_FA_ALL_QUANTS=ON
-          -DLLAMA_CURL=OFF
-
-      - name: Build
-        shell: cmd
-        run: cmake --build build --config Release -j 2
-
-      - name: Collect
+      # ============================================================
+      # Ninja
+      # ============================================================
+      - name: Install Ninja
         shell: powershell
         run: |
-          New-Item -ItemType Directory -Force artifact
+          choco install ninja -y --no-progress
 
-          Copy-Item build\bin\Release\*.exe artifact\
-          Copy-Item build\bin\Release\*.dll artifact\ -ErrorAction SilentlyContinue
+      # ============================================================
+      # Diagnostics
+      # ============================================================
+      - name: Show build environment
+        shell: cmd
+        run: |
+          echo ==================================================
+          echo CUDA_PATH=%CUDA_PATH%
+          echo ==================================================
 
-          $cuda = $env:CUDA_PATH
-          Copy-Item "$cuda\bin\cudart64*.dll" artifact\ -ErrorAction SilentlyContinue
-          Copy-Item "$cuda\bin\cublas64*.dll" artifact\ -ErrorAction SilentlyContinue
-          Copy-Item "$cuda\bin\cublasLt64*.dll" artifact\ -ErrorAction SilentlyContinue
+          where cmake
+          cmake --version
 
-      - name: Upload artifact
+          echo.
+          where ninja
+          ninja --version
+
+          echo.
+          where cl
+
+          echo.
+          "%CUDA_PATH%\bin\nvcc.exe" --version
+
+      # ============================================================
+      # Configure
+      #
+      # Important:
+      # - Ninja instead of VS generator, avoiding CUDA VS integration
+      # - explicit nvcc
+      # - native Blackwell sm_120
+      # - IQK optimized kernels
+      # - all IQK FA cache quant combinations
+      # - CUDA graphs
+      # - one scheduler copy to reduce VRAM overhead
+      # ============================================================
+      - name: Configure Release build
+        shell: cmd
+        run: >
+          cmake
+          -S .
+          -B build
+          -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_C_COMPILER=cl.exe
+          -DCMAKE_CXX_COMPILER=cl.exe
+          -DCMAKE_CUDA_COMPILER="%CUDA_PATH%\bin\nvcc.exe"
+          -DCUDAToolkit_ROOT="%CUDA_PATH%"
+          -DCMAKE_CUDA_ARCHITECTURES=120
+          -DCMAKE_CUDA_STANDARD=17
+          -DGGML_CUDA=ON
+          -DGGML_IQK_MUL_MAT=ON
+          -DGGML_IQK_FLASH_ATTENTION=ON
+          -DGGML_IQK_FA_ALL_QUANTS=ON
+          -DGGML_CUDA_USE_GRAPHS=ON
+          -DGGML_SCHED_MAX_COPIES=1
+          -DGGML_OPENMP=ON
+          -DLLAMA_CURL=OFF
+
+      # ============================================================
+      # Show selected CMake configuration
+      # This lets us confirm the important switches in Actions log
+      # ============================================================
+      - name: Show CUDA and IQK configuration
+        shell: cmd
+        run: |
+          cmake -LAH build | findstr /I "CUDA_ARCHITECTURES GGML_CUDA GGML_IQK GGML_SCHED_MAX_COPIES GGML_OPENMP"
+
+      # ============================================================
+      # Build
+      #
+      # -j 2 intentionally:
+      # ik_llama CUDA template compilation is extremely RAM hungry.
+      # Higher parallelism can make GitHub runner unstable.
+      # ============================================================
+      - name: Build Release
+        shell: cmd
+        run: |
+          cmake --build build --parallel 2
+
+      # ============================================================
+      # Collect binaries
+      # Ninja build normally outputs into build\bin
+      # ============================================================
+      - name: Collect binaries
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          New-Item -ItemType Directory -Force -Path artifact | Out-Null
+
+          Write-Host "Searching for executables..."
+
+          Get-ChildItem -Path build -Recurse -Filter *.exe | ForEach-Object {
+              Write-Host "EXE:" $_.FullName
+              Copy-Item $_.FullName artifact\ -Force
+          }
+
+          Get-ChildItem -Path build -Recurse -Filter *.dll | ForEach-Object {
+              Write-Host "DLL:" $_.FullName
+              Copy-Item $_.FullName artifact\ -Force
+          }
+
+          Write-Host "Copying CUDA runtime libraries..."
+
+          Get-ChildItem "$env:CUDA_PATH\bin\cudart64*.dll" -ErrorAction SilentlyContinue |
+              Copy-Item -Destination artifact\ -Force
+
+          Get-ChildItem "$env:CUDA_PATH\bin\cublas64*.dll" -ErrorAction SilentlyContinue |
+              Copy-Item -Destination artifact\ -Force
+
+          Get-ChildItem "$env:CUDA_PATH\bin\cublasLt64*.dll" -ErrorAction SilentlyContinue |
+              Copy-Item -Destination artifact\ -Force
+
+          # OpenMP runtime used by MSVC builds if present
+          if (Test-Path "C:\Windows\System32\vcomp140.dll") {
+              Copy-Item "C:\Windows\System32\vcomp140.dll" artifact\ -Force
+          }
+
+          Write-Host ""
+          Write-Host "Artifact contents:"
+          Get-ChildItem artifact | Format-Table Name, Length
+
+      # ============================================================
+      # Sanity-check that the important tools actually exist
+      # ============================================================
+      - name: Validate artifact
+        shell: powershell
+        run: |
+          $server = Get-ChildItem artifact -Filter "llama-server.exe" -ErrorAction SilentlyContinue
+          $quant  = Get-ChildItem artifact -Filter "llama-quantize.exe" -ErrorAction SilentlyContinue
+
+          if (-not $server) {
+              throw "llama-server.exe was not produced"
+          }
+
+          if (-not $quant) {
+              throw "llama-quantize.exe was not produced"
+          }
+
+          Write-Host "llama-server.exe: OK"
+          Write-Host "llama-quantize.exe: OK"
+
+      # ============================================================
+      # Upload
+      # ============================================================
+      - name: Upload Windows sm120 artifact
         uses: actions/upload-artifact@v4
         with:
           name: ik-llama-windows-cuda-sm120
           path: artifact
+          if-no-files-found: error
+          compression-level: 6
