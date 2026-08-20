@@ -1,0 +1,51 @@
+name: Build Windows CUDA RTX 3090
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install CUDA 12.6
+        uses: Jimver/cuda-toolkit@v0.2.24
+        with:
+          cuda: '12.6.3'
+          method: network
+
+      - name: Configure
+        shell: cmd
+        run: >
+          cmake -B build
+          -DCMAKE_BUILD_TYPE=Release
+          -DGGML_CUDA=ON
+          -DGGML_CUDA_USE_GRAPHS=ON
+          -DGGML_CUDA_FA_ALL_QUANTS=ON
+          -DCMAKE_CUDA_ARCHITECTURES=86
+          -DLLAMA_CURL=OFF
+
+      - name: Build
+        shell: cmd
+        run: cmake --build build --config Release -j 2
+
+      - name: Collect binaries
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Force -Path package
+          Copy-Item build\bin\Release\*.exe package\ -ErrorAction SilentlyContinue
+          Copy-Item build\bin\Release\*.dll package\ -ErrorAction SilentlyContinue
+
+          $cuda = $env:CUDA_PATH
+          Copy-Item "$cuda\bin\cudart64_12.dll" package\ -ErrorAction SilentlyContinue
+          Copy-Item "$cuda\bin\cublas64_12.dll" package\ -ErrorAction SilentlyContinue
+          Copy-Item "$cuda\bin\cublasLt64_12.dll" package\ -ErrorAction SilentlyContinue
+
+      - name: Upload Windows build
+        uses: actions/upload-artifact@v4
+        with:
+          name: ik-llama-windows-cuda-sm86
+          path: package
